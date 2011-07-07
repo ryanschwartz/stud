@@ -27,30 +27,7 @@
   *
   **/
 
-#include <sys/types.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
-#include <netdb.h>
-#include <sys/wait.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <assert.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <getopt.h>
-
-#include <sched.h>
-
-#include <openssl/x509.h>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#include <ev.h>
-
-#include "ringbuffer.h"
+#include "stud.h"
 
 #ifndef MSG_NOSIGNAL
 # define MSG_NOSIGNAL 0
@@ -59,12 +36,6 @@
 /* Globals */
 static struct ev_loop *loop;
 static struct addrinfo *backaddr;
-
-/* Command line Options */
-typedef enum {
-    ENC_TLS,
-    ENC_SSL
-} ENC_TYPE;
 
 typedef struct stud_options {
     ENC_TYPE ETYPE;
@@ -80,44 +51,9 @@ typedef struct stud_options {
 } stud_options;
 
 static stud_options OPTIONS;
+
 static char tcp4_proxy_line[64] = "";
 static char tcp6_proxy_line[128] = "";
-
-/* What agent/state requests the shutdown--for proper half-closed
- * handling */
-typedef enum _SHUTDOWN_REQUESTOR {
-    SHUTDOWN_HARD,
-    SHUTDOWN_DOWN,
-    SHUTDOWN_UP
-} SHUTDOWN_REQUESTOR;
-
-/*
- * Proxied State
- *
- * All state associated with one proxied connection
- */
-typedef struct proxystate {
-    ringbuffer ring_down; /* pushing bytes from client to backend */
-    ringbuffer ring_up;   /* pushing bytes from backend to client */
-
-    ev_io ev_r_up;        /* Upstream write event */
-    ev_io ev_w_up;        /* Upstream read event */
-
-    ev_io ev_r_handshake; /* Downstream write event */
-    ev_io ev_w_handshake; /* Downstream read event */
-
-    ev_io ev_r_down;      /* Downstream write event */
-    ev_io ev_w_down;      /* Downstream read event */
-
-    int fd_up;            /* Upstream (client) socket */
-    int fd_down;          /* Downstream (backend) socket */
-
-    int want_shutdown;    /* Connection is half-shutdown */
-
-    SSL *ssl;             /* OpenSSL SSL state */
-
-    struct sockaddr_storage remote_ip;  /* Remote ip returned from `accept` */
-} proxystate;
 
 /* set a file descriptor (socket) to non-blocking mode */
 static void setnonblocking(int fd) {
@@ -249,6 +185,17 @@ static void shutdown_proxy(proxystate *ps, SHUTDOWN_REQUESTOR req) {
         close(ps->fd_down);
 
         SSL_free(ps->ssl);
+
+#ifdef PROTO_HTTP
+        free(ps->ph.parser);
+
+        /* free all malloc'd fields and values */
+        for (int i = 0; i < ps->ph.nlines; i++) {
+          free(ps->ph.header[i].field);
+          free(ps->ph.header[i].value);
+        }
+        free(ps->ph.uri);
+#endif
 
         free(ps);
     }
@@ -476,15 +423,76 @@ static void handle_fatal_ssl_error(proxystate *ps, int err) {
 static void client_read(struct ev_loop *loop, ev_io *w, int revents) {
     (void) revents;
     int t;    
+    int length_written = 0;
     proxystate *ps = (proxystate *)w->data;
     if (ps->want_shutdown) {
         ev_io_stop(loop, &ps->ev_r_up);
         return;
     }
-    char * buf = ringbuffer_write_ptr(&ps->ring_down);
+#ifdef PROTO_HTTP
+    char buf[RING_DATA_LEN] = {0};
+#else
+    char *buf = ringbuffer_write_ptr(&ps->ring_down);
+#endif
     t = SSL_read(ps->ssl, buf, RING_DATA_LEN);
+
+    /* Goals:
+         • Read from SSL into buffer
+         • Pass into http_parser_execute
+         • Get callbacks for headers/values/headers_done
+           • Store first line (method, url, version)
+           • Store headers & values in a new growing buffer
+           • remove x-forwarded-for and x-forwarded-proto
+           • when headers done
+             • inject x-forwarded-for and x-forwarded-proto
+           * re-combine METHOD URI HTTP/1.1
+                        HEADERS...
+                        BODY
+           • write init line and headers into ring buffer
+           • slurp rest of body
+           • write body into ring buffer
+    */
+
     if (t > 0) {
-        ringbuffer_write_append(&ps->ring_down, t);
+#ifdef PROTO_HTTP
+        int nparsed = http_parser_execute(ps->ph.parser,
+                        &ps->ph.settings, buf, t);
+        if (nparsed != t) {
+          return;  /* PARSING ERROR */
+        }
+
+        if (!ps->ph.done_parsing_http) {
+          return;
+        }
+
+        const char *method = http_method_str(ps->ph.method);
+        char *URI = ps->ph.uri;
+        char full_method[4096] = {0};
+        int method_sz;
+        method_sz = snprintf(full_method, 4096, "%s %s HTTP/1.1\n",method, URI);
+        if (method_sz >= 4096) {
+          return; /* header too long.  handle error better */
+        }
+        char *headers = assemble_headers(ps);
+        int header_len = strlen(headers);
+
+        char *body = ps->ph.body;
+        int body_len = ps->ph.body_sz;
+
+        char *ringbuf = ringbuffer_write_ptr(&ps->ring_down);
+        memcpy(ringbuf, full_method, method_sz);
+        length_written += method_sz;
+        memcpy(ringbuf + length_written, headers, header_len);
+        length_written += header_len;
+        memcpy(ringbuf + length_written, body, body_len);
+        length_written += body_len;
+
+        free(headers);
+        free(body);
+#else
+        length_written = t;
+#endif
+        ringbuffer_write_append(&ps->ring_down, length_written);
         if (ringbuffer_is_full(&ps->ring_down))
             ev_io_stop(loop, &ps->ev_r_up);
         safe_enable_io(ps, &ps->ev_w_down);
@@ -572,6 +580,35 @@ static void handle_accept(struct ev_loop *loop, ev_io *w, int revents) {
     ps->ssl = ssl;
     ps->want_shutdown = 0;
     ps->remote_ip = addr;
+
+#ifdef PROTO_HTTP
+    ps->ph.nlines = 0;  /* auto-incremented to one on first header field */
+    ps->ph.body = NULL;
+    ps->ph.body_sz = 0;
+    ps->ph.stripped_last_header = 0;
+    ps->ph.settings.on_message_begin = NULL;
+    ps->ph.settings.on_path = NULL;
+    ps->ph.settings.on_query_string = NULL;
+    ps->ph.settings.on_message_complete = on_message_complete;
+    ps->ph.settings.on_url = cb_url;
+    ps->ph.settings.on_header_field = on_header_field;
+    ps->ph.settings.on_header_value = on_header_value;
+    ps->ph.settings.on_headers_complete = cb_headers_complete;
+    ps->ph.settings.on_body = on_body;
+    ps->ph.parser = malloc(sizeof(*(ps->ph.parser)));
+    ps->ph.uri = NULL;
+    ps->ph.done_parsing_http = 0;
+    ps->ph.parser->data = ps;
+    ps->ph.last_was_value = 1; /* start with last_was_value so Field is read */
+
+    http_parser_init(ps->ph.parser, HTTP_REQUEST);
+
+    for (int i = 0; i < MAX_HEADER_LINES; i++) {
+      ps->ph.header[i].field = NULL;
+      ps->ph.header[i].value = NULL;
+    }
+#endif
+
     ringbuffer_init(&ps->ring_up);
     ringbuffer_init(&ps->ring_down);
 
@@ -635,8 +672,13 @@ static void usage_fail(char *prog, char *msg) {
 
     fprintf(stderr,
 "Encryption Methods:\n"
+#ifdef PROTO_HTTP
+"  --tls                    (TLSv1)\n"
+"  --ssl                    (SSLv3, default)\n"
+#else
 "  --tls                    (TLSv1, default)\n"
 "  --ssl                    (SSLv3)\n"
+#endif
 "  -c CIPHER_SUITE          (set allowed ciphers)\n"            
 "\n"
 "Socket:\n"
@@ -700,7 +742,11 @@ static void parse_cli(int argc, char **argv) {
     OPTIONS.BACK_IP = "127.0.0.1";
     OPTIONS.BACK_PORT = "8000";
 
+#ifdef PROTO_HTTP
+    OPTIONS.ETYPE = ENC_SSL;
+#else
     OPTIONS.ETYPE = ENC_TLS;
+#endif
 
     OPTIONS.NCORES = 1;
 
