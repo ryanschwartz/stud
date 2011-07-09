@@ -1,13 +1,23 @@
-all: stud stud-http stud-http-jem
+all: stud stud-jem stud-http stud-http-jem
 
-stud: stud.c Makefile
-	gcc -O2 -g -std=c99 -fno-strict-aliasing -Wall -W -I/usr/local/include -L/usr/local/lib -L/sw/lib -I/sw/include -I. -o stud ringbuffer.c stud.c -D_GNU_SOURCE -lssl -lcrypto -lev
+BASIC_DEPS=stud.c ringbuffer.c
+HTTP_DEPS=http-parser/http_parser.o proto_http.c proto_http.h
+JEM_DEPS=jemalloc/jemalloc/lib/libjemalloc.a
+LIBEV_DEPS=libev/lib/libev.a
 
-stud-http: stud.c Makefile http-parser/http_parser.o proto_http.c proto_http.h
-	gcc -DPROTO_HTTP -O2 -g -std=c99 -fno-strict-aliasing -Wall -W -I/usr/local/include -L/usr/local/lib -L/sw/lib -I/sw/include -I. -o stud-http ringbuffer.c stud.c proto_http.c http-parser/http_parser.o -D_GNU_SOURCE -lssl -lcrypto -lev
+HTTP_JEM_DEPS=$(HTTP_DEPS) $(JEM_DEPS)
 
-stud-http-jem: stud.c Makefile http-parser/http_parser.o proto_http.c jemalloc/jemalloc/lib/libjemalloc.a
-	gcc -DPROTO_HTTP -O2 -g -std=c99 -fno-strict-aliasing -Wall -W -I/usr/local/include -L/usr/local/lib -L/sw/lib -I/sw/include -I. -o stud-http-jem ringbuffer.c stud.c proto_http.c http-parser/http_parser.o -D_GNU_SOURCE -lssl -lcrypto -lev jemalloc/jemalloc/lib/libjemalloc.a -ldl -lpthread
+stud: stud.c Makefile $(LIBEV_DEPS)
+	gcc -O2 -g -std=c99 -fno-strict-aliasing -Wall -W -I/usr/local/include -L/usr/local/lib -Ilibev/include -I. -o $@ ringbuffer.c stud.c -D_GNU_SOURCE -lssl libev/lib/libev.a -lcrypto -lm
+
+stud-jem: stud.c Makefile $(JEM_DEPS) $(LIBEV_DEPS)
+	gcc -O2 -g -std=c99 -fno-strict-aliasing -Wall -W -I/usr/local/include -L/usr/local/lib -Ilibev/include -I. -o $@ ringbuffer.c stud.c -D_GNU_SOURCE -lssl -lcrypto libev/lib/libev.a -lm jemalloc/jemalloc/lib/libjemalloc.a -ldl -lpthread
+
+stud-http: stud.c Makefile $(HTTP_DEPS) $(LIBEV_DEPS)
+	gcc -DPROTO_HTTP -O2 -g -std=c99 -fno-strict-aliasing -Wall -W -I/usr/local/include -L/usr/local/lib -Ilibev/include -I. -o $@ ringbuffer.c stud.c proto_http.c http-parser/http_parser.o -D_GNU_SOURCE -lssl -lcrypto libev/lib/libev.a -lm
+
+stud-http-jem: stud.c Makefile $(HTTP_DEPS) $(JEM_DEPS) $(LIBEV_DEPS)
+	gcc -DPROTO_HTTP -O2 -g -std=c99 -fno-strict-aliasing -Wall -W -I/usr/local/include -L/usr/local/lib -Ilibev/include -I. -o $@ ringbuffer.c stud.c proto_http.c http-parser/http_parser.o -D_GNU_SOURCE -lssl -lcrypto libev/lib/libev.a -lm jemalloc/jemalloc/lib/libjemalloc.a -ldl -lpthread
 
 http-parser/http_parser.o: http-parser/README.md
 	make -C http-parser http_parser.o
@@ -22,9 +32,14 @@ jemalloc/jemalloc/autogen.sh:
 	git clone git://canonware.com/jemalloc.git
 	cd jemalloc/jemalloc; ./autogen.sh; make -j4
 
+libev/lib/libev.a:
+	curl -O http://dist.schmorp.de/libev/libev-4.04.tar.gz
+	tar xfvzp libev*.gz
+	cd libev-*; ./configure --prefix=`pwd`/../libev/; make install
+
 install: stud
 	cp stud /usr/local/bin
 
 clean:
-	rm -f stud stud-http stud-http-jem *.o tags
-	rm -rf jemalloc/ http-parser/
+	rm -f stud stud-jem stud-http stud-http-jem *.o tags
+	rm -rf jemalloc/ http-parser/ libev*
