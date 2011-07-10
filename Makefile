@@ -1,23 +1,57 @@
-all: stud stud-jem stud-http stud-http-jem
+CC=gcc
 
-BASIC_DEPS=stud.c ringbuffer.c
+STATIC_JEM=yes
+STATIC_LIBEV=yes
+
+STUD_C=ringbuffer.c stud.c
+STUD_HTTP_C=$(STUD_C) proto_http.c http-parser/http_parser.o
+
+BASIC_DEPS=$(STUD_C) Makefile
 HTTP_DEPS=http-parser/http_parser.o proto_http.c proto_http.h
 JEM_DEPS=jemalloc/jemalloc/lib/libjemalloc.a
 LIBEV_DEPS=libev/lib/libev.a
 
-HTTP_JEM_DEPS=$(HTTP_DEPS) $(JEM_DEPS)
+LIBEV_STATIC=libev/lib/libev.a -lm
+JEM_STATIC=jemalloc/jemalloc/lib/libjemalloc.a -ldl -lpthread
 
-stud: stud.c Makefile $(LIBEV_DEPS)
-	gcc -O2 -g -std=c99 -fno-strict-aliasing -Wall -W -I/usr/local/include -L/usr/local/lib -Ilibev/include -I. -o $@ ringbuffer.c stud.c -D_GNU_SOURCE -lssl libev/lib/libev.a -lcrypto -lm
+LDFLAGS=-L/usr/local/lib -L/sw/lib
 
-stud-jem: stud.c Makefile $(JEM_DEPS) $(LIBEV_DEPS)
-	gcc -O2 -g -std=c99 -fno-strict-aliasing -Wall -W -I/usr/local/include -L/usr/local/lib -Ilibev/include -I. -o $@ ringbuffer.c stud.c -D_GNU_SOURCE -lssl -lcrypto libev/lib/libev.a -lm jemalloc/jemalloc/lib/libjemalloc.a -ldl -lpthread
+CFLAGS=-O2 -g --std=c99 -fno-strict-aliasing -Wall -W -D_GNU_SOURCE
+CFLAGS+=-I/usr/local/include -I./libev/include -I/sw/include
+HTTP_CFLAGS=-DPROTO_HTTP $(CFLAGS)
 
-stud-http: stud.c Makefile $(HTTP_DEPS) $(LIBEV_DEPS)
-	gcc -DPROTO_HTTP -O2 -g -std=c99 -fno-strict-aliasing -Wall -W -I/usr/local/include -L/usr/local/lib -Ilibev/include -I. -o $@ ringbuffer.c stud.c proto_http.c http-parser/http_parser.o -D_GNU_SOURCE -lssl -lcrypto libev/lib/libev.a -lm
+ifeq ($(STATIC_JEM), yes)
+  JEM=$(JEM_STATIC)
+else
+  JEM=-ljemalloc
+  JEM_DEPS=
+endif
 
-stud-http-jem: stud.c Makefile $(HTTP_DEPS) $(JEM_DEPS) $(LIBEV_DEPS)
-	gcc -DPROTO_HTTP -O2 -g -std=c99 -fno-strict-aliasing -Wall -W -I/usr/local/include -L/usr/local/lib -Ilibev/include -I. -o $@ ringbuffer.c stud.c proto_http.c http-parser/http_parser.o -D_GNU_SOURCE -lssl -lcrypto libev/lib/libev.a -lm jemalloc/jemalloc/lib/libjemalloc.a -ldl -lpthread
+ifeq ($(STATIC_LIBEV), yes)
+  LIBEV=$(LIBEV_STATIC)
+else
+  LIBEV=-lev
+  LIBEV_DEPS=
+endif
+
+LIBS=-lssl -lcrypto $(LIBEV)
+
+.PHONY: default bonus
+
+default: stud
+all: stud stud-jem stud-http stud-http-jem
+
+stud: $(BASIC_DEPS) $(LIBEV_DEPS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(STUD_C) $(LIBS)
+
+stud-jem: $(BASIC_DEPS) $(JEM_DEPS) $(LIBEV_DEPS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(STUD_C) $(LIBS) $(JEM)
+
+stud-http: $(BASIC_DEPS) $(HTTP_DEPS) $(LIBEV_DEPS)
+	$(CC) $(HTTP_CFLAGS) $(LDFLAGS) -o $@ $(STUD_HTTP_C) $(LIBS)
+
+stud-http-jem: $(BASIC_DEPS) $(HTTP_DEPS) $(JEM_DEPS) $(LIBEV_DEPS)
+	$(CC) $(HTTP_CFLAGS) $(LDFLAGS) -o $@ $(STUD_HTTP_C) $(LIBS) $(JEM)
 
 http-parser/http_parser.o: http-parser/README.md
 	make -C http-parser http_parser.o
