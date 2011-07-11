@@ -27,6 +27,7 @@
   *
   **/
 
+#include <limits.h>
 #include "stud.h"
 
 #ifndef MSG_NOSIGNAL
